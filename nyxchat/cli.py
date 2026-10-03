@@ -578,19 +578,86 @@ class App:
         return pub
 
     def resolve_username(self, name):
-        for dom in NIP05_DOMAINS:
-            ident = f"{name}@{dom}"
-            if not self.node:
-                return None, None
+        """Resolve @username: local → NIP-05 → relay kind:0 search."""
+        name = (name or "").strip().lstrip("@").lower()
+        if not name:
+            return None, None
+        # 1) local aliases / contacts
+        if name in self.aliases:
+            return self.aliases[name], name
+        for pub, c in self.contacts.items():
+            n = (c.get("name") or "").lower().lstrip("@")
+            if n == name:
+                return pub, name
+        # 2) NIP-05 on known domains
+        if self.node:
             try:
                 s = self.node.session()
             except Exception as e:
+                s = None
                 self.toast_msg(f"Tor: {e}")
-                return None, None
-            pub = nip05_resolve(s, ident)
-            if pub:
-                return pub, ident
+            if s is not None:
+                for dom in NIP05_DOMAINS:
+                    ident = f"{name}@{dom}"
+                    pub = nip05_resolve(s, ident)
+                    if pub:
+                        return pub, ident
+        # 3) search kind:0 profiles on relays (NIP-50 or recent profiles)
+        pub = self._search_profile_name(name)
+        if pub:
+            return pub, name
         return None, None
+
+    def _search_profile_name(self, name, timeout=10.0):
+        """Ask relays for kind:0 matching name / display_name."""
+        if not self.node:
+            return None
+        name = name.lower()
+        sid = "nyxname_" + name[:12]
+        # NIP-50 search + broad kind:0 pull
+        filters = [
+            {"kinds": [0], "search": name, "limit": 30},
+            {"kinds": [0], "limit": 80},
+        ]
+        self.node.subscribe(sid, filters)
+        deadline = time.time() + timeout
+        found = None
+        while time.time() < deadline:
+            try:
+                msg = self.node.out.get(timeout=0.4)
+            except queue.Empty:
+                self.draw()
+                continue
+            if not msg:
+                continue
+            if msg[0] == "profile":
+                pub = msg[1]
+                disp = (msg[2] or "").lower().lstrip("@")
+                pr = msg[4] if len(msg) > 4 and isinstance(msg[4], dict) else {}
+                uname = (pr.get("name") or "").lower().lstrip("@")
+                dname = (pr.get("display_name") or "").lower().lstrip("@")
+                if name in (uname, dname, disp):
+                    found = pub
+                    # apply name immediately
+                    shown = pr.get("display_name") or pr.get("name") or msg[2]
+                    self._add_contact(pub, name=shown or name)
+                    if uname:
+                        self.aliases[uname] = pub
+                    break
+            else:
+                # re-queue other events
+                try:
+                    self.handle_node(msg)
+                except Exception:
+                    pass
+            self.draw()
+        # stop search sub
+        try:
+            for r in self.node.relays:
+                r.send(["CLOSE", sid])
+        except Exception:
+            pass
+        return found
 
     def open_add_contact(self):
         raw = self.modal_input(
@@ -617,7 +684,7 @@ class App:
                 pub = self.aliases.get(name)
                 ident = f"@{name}"
                 if not pub:
-                    self.toast = (f"resolving @{name}…", self.frame, self.frame + 3000)
+                    self.toast_msg(f"resolving @{name}…")
                     self.draw()
                     self.s.refresh()
                     pub, ident2 = self.resolve_username(name)
@@ -639,8 +706,14 @@ class App:
                 self.save_contacts()
                 self.toast_msg(f"added {raw}")
             else:
-                self._add_contact(parse_pub(raw))
-                self.toast_msg("Contact added")
+                pub = parse_pub(raw)
+                self._add_contact(pub)
+                if self.node:
+                    self.node.subscribe(
+                        "prof_" + pub[:12],
+                        [{"kinds": [0], "authors": [pub], "limit": 1}],
+                    )
+                self.toast_msg("Contact added — fetching name…")
             if self.node:
                 self.node.subscribe("profiles",
                                     [{"kinds": [0], "authors": list(self.contacts.keys())}])
@@ -703,10 +776,24 @@ class App:
             _, rumor, _wid = msg
             self.on_dm(rumor)
         elif k == "profile":
-            _, pub, name, _ts = msg
-            if pub in self.contacts and name:
-                self.contacts[pub]["name"] = name
+            pub = msg[1]
+            label = msg[2] or ""
+            pr = msg[4] if len(msg) > 4 and isinstance(msg[4], dict) else {}
+            uname = (pr.get("name") or "").strip().lstrip("@")
+            disp = (pr.get("display_name") or label or uname).strip()
+            shown = disp or uname or label
+            if not shown:
+                return
+            if pub in self.contacts:
+                self.contacts[pub]["name"] = shown
+                if uname:
+                    self.aliases[uname.lower()] = pub
                 self.refresh_chats()
+            else:
+                self._add_contact(pub, name=shown)
+                if uname:
+                    self.aliases[uname.lower()] = pub
+                    self.save_contacts()
 
     def on_dm(self, rumor):
         sender = rumor.get("pubkey", "")
@@ -744,6 +831,12 @@ class App:
             c = g
         else:
             c = self.contacts.get(sender) or self._add_contact(sender)
+            # fetch their profile so display name shows up
+            if self.node:
+                self.node.subscribe(
+                    "prof_" + sender[:12],
+                    [{"kinds": [0], "authors": [sender], "limit": 1}],
+                )
         c["last_t"] = time.time()
         c["order"] = time.time()
         if content.startswith("NYXFILE:"):
@@ -1183,9 +1276,11 @@ class App:
             if f >= until:
                 self.toast = None
             else:
-                lab = " " + visual(txt) + " "
-                x = w - len(lab) - 2 + max(0, 14 - (f - t0) * 3)
-                self.safe(0, x, lab, A(9) | self.curses.A_BOLD)
+                lab = " " + visual(str(txt))[: max(8, w - 4)] + " "
+                # keep fully on-screen (bottom bar is safer than top-right slide)
+                x = max(0, min(w - len(lab) - 1, (w - len(lab)) // 2))
+                y = max(0, h - 2)
+                self.safe(y, x, lab, A(9) | self.curses.A_BOLD)
         if self.curtain is not None:
             p = f - self.curtain
             if p < 8:
@@ -1293,9 +1388,9 @@ class App:
                 if buf or allow_empty:
                     del win
                     return buf.strip()
-            elif k in ("\x7f", "\b"):
+            elif k in ("\x7f", "\b", "\x08") or (isinstance(k, str) and ord(k) in (8, 127)) or k in (curses.KEY_BACKSPACE, getattr(curses, "KEY_DC", -2), 263, 8, 127):
                 buf = buf[:-1]
-            elif k.isprintable():
+            elif isinstance(k, str) and k.isprintable():
                 buf += k
 
     # ---------- input ----------
@@ -1355,7 +1450,7 @@ class App:
                 self.download_last_file()
             elif k == "\x14":          # Ctrl+T
                 self.start_theme()
-            elif k in ("\x7f", "\b"):
+            elif k in ("\x7f", "\b", "\x08") or ord(k) in (8, 127):
                 self.buf = self.buf[:-1]
             elif k.isprintable():
                 self.buf += k
@@ -1370,7 +1465,7 @@ class App:
             self.scroll += 5
         elif k == curses.KEY_NPAGE:
             self.scroll = max(0, self.scroll - 5)
-        elif k == curses.KEY_BACKSPACE:
+        elif k in (curses.KEY_BACKSPACE, getattr(curses, "KEY_DC", -2), 8, 127, 263):
             self.buf = self.buf[:-1]
         elif k == getattr(curses, "KEY_ENTER", -1):
             self.send()
@@ -1424,18 +1519,36 @@ class App:
         self.load_groups()
         self.onboarding()
         self.start_node()
-        while True:
-            self.frame += 1
-            self.tick()
-            self.draw()
-            try:
-                k = self.s.get_wch()
-            except self.curses.error:
-                k = None
-            if self.key(k):
-                break
-        if self.node:
-            self.node.stop()
+        # keep relay/tor logs from wrecking the curses UI
+        log_path = HOME / "nyx.log"
+        try:
+            _logf = open(log_path, "a", encoding="utf-8")
+            _old_err = sys.stderr
+            sys.stderr = _logf
+        except Exception:
+            _logf = None
+            _old_err = None
+        try:
+            while True:
+                self.frame += 1
+                self.tick()
+                self.draw()
+                try:
+                    k = self.s.get_wch()
+                except self.curses.error:
+                    k = None
+                if self.key(k):
+                    break
+        finally:
+            if self.node:
+                self.node.stop()
+            if _old_err is not None:
+                sys.stderr = _old_err
+            if _logf is not None:
+                try:
+                    _logf.close()
+                except Exception:
+                    pass
 
 
 def main(scr):

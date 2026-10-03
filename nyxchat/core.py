@@ -714,8 +714,15 @@ class Node:
                     self.out.put(("dm", rumor, ev["id"]))
                 elif k == 0 and verify_event(ev):
                     pr = parse_kind0(ev.get("content", ""))
-                    name = pr.get("display_name") or pr.get("name") or ""
-                    self.out.put(("profile", ev["pubkey"], name, ev.get("created_at", 0)))
+                    # prefer display_name for UI; keep name (username) as fallback
+                    label = pr.get("display_name") or pr.get("name") or ""
+                    self.out.put((
+                        "profile",
+                        ev["pubkey"],
+                        label,
+                        ev.get("created_at", 0),
+                        pr,  # full profile dict for username matching
+                    ))
                 elif k == 1 and verify_event(ev):
                     self.out.put(("note", ev))
             except Exception:
