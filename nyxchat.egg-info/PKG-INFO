@@ -1,0 +1,93 @@
+Metadata-Version: 2.4
+Name: nyxchat
+Version: 0.3.1
+Summary: Nostr over Tor, in your terminal
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: websocket-client>=1.6
+Requires-Dist: requests[socks]>=2.28
+Requires-Dist: cryptography>=41
+Requires-Dist: windows-curses>=2.3; sys_platform == "win32"
+
+# Nyx
+
+Private terminal messenger on Nostr over Tor.
+
+Optimized for heavy censorship (Iran, Russia, …).
+
+## Install
+
+    pip install .
+
+## Run
+
+    nyx
+
+First run auto-installs:
+- a private Tor binary
+- lyrebird (Snowflake + WebTunnel + obfs4)
+- Python dependencies
+- fresh bridges from multiple sources
+
+No manual download required.
+
+## Censorship resistance (Iran)
+
+Transport order (automatic fallback):
+
+1. **Snowflake** – WebRTC volunteer proxies, no bridge list needed
+2. **WebTunnel** – looks like normal HTTPS (currently strongest against Iranian DPI)
+3. **obfs4** – classic obfuscation with freshly fetched bridges
+
+If one transport is blocked or stuck, Nyx automatically switches to the next.
+
+Bridges are pulled live from:
+- OnionHop tested lists (hourly)
+- official BridgeDB
+- community mirrors
+
+## Keys
+
+  Up/Down     switch chat
+  Enter       send message
+  Ctrl+N      add contact  (@username / npub / name@domain)
+  Ctrl+E      display name
+  Ctrl+U      @username  (Telegram-style)
+  Ctrl+G      new group
+  Ctrl+Y      new channel
+  Ctrl+K      add member to current group/channel
+  Ctrl+F      send a file
+  Ctrl+D      download last file
+  F2          change theme
+  PgUp/PgDn   scroll
+  Esc/Ctrl+C  quit
+
+## Groups & channels
+
+- **Group** (Ctrl+G): everyone can message; encrypted to all members
+- **Channel** (Ctrl+Y): only the owner can post; members receive
+- Add people with @username, npub, or name@domain
+
+## Message formatting
+
+  **bold**   *italic*   `code`   ~~strike~~
+  ``` multi-line code ```
+
+## Config
+
+  ~/.nyx/key            your nsec  (chmod 600)
+  ~/.nyx/profile.json   display name, username
+  ~/.nyx/contacts.json  contact list
+  ~/.nyx/tor/           private Tor datadir + torrc
+  ~/.nyx/bin/           private Tor + lyrebird binaries
+
+  Override with env `NYX_HOME=/some/path`.
+
+## Note on total national blackouts
+
+When international connectivity is completely cut (true nationwide shutdown),
+no software-only solution can reach the outside world. In those rare cases
+Starlink (or similar satellite) is currently the only practical option.
+As long as *any* path to the global internet remains, Nyx will keep trying
+every available transport automatically.
+
