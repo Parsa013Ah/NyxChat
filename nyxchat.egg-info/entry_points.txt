@@ -1,2 +1,0 @@
-[console_scripts]
-nyx = nyxchat.cli:entry
