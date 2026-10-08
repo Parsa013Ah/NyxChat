@@ -7,8 +7,36 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("NYX_HOME") or os.path.expanduser("~/.nyx"))
 HOME.mkdir(mode=0o700, exist_ok=True)
+try:
+    # mkdir(mode=...) only applies on creation; enforce it even if the
+    # directory already existed with weaker permissions (e.g. umask, or
+    # an older version of nyx that didn't lock it down).
+    os.chmod(HOME, 0o700)
+except OSError:
+    pass
 BIN = HOME / "bin"
 BIN.mkdir(parents=True, exist_ok=True)
+
+
+def write_secret(path, text: str):
+    """Write a secret file so it is never, even momentarily, readable by
+    other local users. Creates with mode 0600 atomically instead of
+    write-then-chmod, which has a race window under a permissive umask."""
+    path = Path(path)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 IS_WIN = platform.system() == "Windows"
 TOR_EXE = "tor.exe" if IS_WIN else "tor"

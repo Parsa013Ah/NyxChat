@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pip install -e .
+      - run: pyinstaller --onefile --name nyx --hidden-import nyxchat nyxchat/__main__.py
+      - run: mkdir dist-nyx && cp dist/nyx* dist-nyx/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-${{ matrix.os }}
+          path: dist-nyx/

@@ -318,6 +318,8 @@ def gift_wrap(sk, rumor, target_pub):
 def unwrap(sk, wrap):
     if wrap.get("kind") != 1059:
         raise ValueError("not a gift wrap")
+    if not verify_event(wrap):
+        raise ValueError("bad wrap signature")
     me = pubhex(sk)
     tags = wrap.get("tags") or []
     if not any(t and t[0] == "p" and len(t) >= 2 and t[1] == me for t in tags):
@@ -563,7 +565,9 @@ class Relay(threading.Thread):
                         raise ConnectionError("closed")
                     self.node.handle(raw)
             except Exception as e:
-                print(f"[nyx] relay {self.url}: {type(e).__name__}: {e}",
+                # keep it short — long Cloudflare/HTML bodies destroy terminals
+                msg = str(e).replace("\n", " ")[:120]
+                print(f"[nyx] relay {self.url}: {type(e).__name__}: {msg}",
                       file=sys.stderr, flush=True)
             self.state = "down"
             try:
@@ -819,13 +823,22 @@ def upload(session, servers, ct, cb):
     raise RuntimeError(err)
 
 
-def download(session, url, cb, expected_sha256=None):
+_MAX_DOWNLOAD = 512 * 1024 * 1024  # hard cap: refuse to let a malicious/compromised
+                                    # Blossom server exhaust memory via a huge or
+                                    # mislabeled response
+
+
+def download(session, url, cb, expected_sha256=None, max_bytes=_MAX_DOWNLOAD):
     r = session.get(url, stream=True, timeout=120)
     r.raise_for_status()
     total = int(r.headers.get("Content-Length") or 0)
+    if total and total > max_bytes:
+        raise ValueError(f"remote file too large ({total} bytes > {max_bytes} limit)")
     buf = bytearray()
     for ch in r.iter_content(65536):
         buf += ch
+        if len(buf) > max_bytes:
+            raise ValueError(f"download exceeded {max_bytes} byte limit")
         if total:
             cb(len(buf) / total)
     data = bytes(buf)

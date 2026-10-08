@@ -337,11 +337,7 @@ class App:
         else:
             raise ValueError("bad key")
         self.pub = pubhex(self.sk)
-        (HOME / "key").write_text(nsec(self.sk), encoding="utf-8")
-        try:
-            os.chmod(HOME / "key", 0o600)
-        except OSError:
-            pass
+        bootstrap.write_secret(HOME / "key", nsec(self.sk))
 
     def first_run_dialog(self):
         curses = self.curses
@@ -372,11 +368,7 @@ class App:
             if k in ("g", "G"):
                 self.sk = new_sk()
                 self.pub = pubhex(self.sk)
-                (HOME / "key").write_text(nsec(self.sk), encoding="utf-8")
-                try:
-                    os.chmod(HOME / "key", 0o600)
-                except OSError:
-                    pass
+                bootstrap.write_secret(HOME / "key", nsec(self.sk))
                 self.toast_msg("New identity generated")
                 return True
             if k in ("p", "P"):
@@ -551,6 +543,8 @@ class App:
 
     def _add_contact(self, pub, name=None, save=True):
         pub = pub.lower()
+        if self.pub and pub == self.pub.lower():
+            return None  # never create a chat with yourself
         if pub in self.contacts:
             if name:
                 self.contacts[pub]["name"] = name
@@ -707,6 +701,9 @@ class App:
                 self.toast_msg(f"added {raw}")
             else:
                 pub = parse_pub(raw)
+                if self.pub and pub.lower() == self.pub.lower():
+                    self.toast_msg("That's your own key")
+                    return
                 self._add_contact(pub)
                 if self.node:
                     self.node.subscribe(
@@ -796,11 +793,12 @@ class App:
                     self.save_contacts()
 
     def on_dm(self, rumor):
-        sender = rumor.get("pubkey", "")
+        sender = (rumor.get("pubkey") or "").lower()
         rid = rumor.get("id", "")
         if not sender:
             return
-        if sender == self.pub and rid in self.sent_ids:
+        # Always ignore our own echoes — message was already shown locally
+        if self.pub and sender == self.pub.lower():
             return
         content = rumor.get("content", "")
         if rumor.get("kind") != 14 or not content:
@@ -830,7 +828,11 @@ class App:
                 self.save_groups()
             c = g
         else:
-            c = self.contacts.get(sender) or self._add_contact(sender)
+            c = self.contacts.get(sender)
+            if not c:
+                c = self._add_contact(sender)
+            if not c:
+                return
             # fetch their profile so display name shows up
             if self.node:
                 self.node.subscribe(
@@ -929,14 +931,32 @@ class App:
                 def cb(p):
                     self.download_progress = p
 
-                ct = download(session, info["url"], cb, info.get("sha256"))
-                data = decrypt_file(ct, info["key"], info["nonce"])
+                # basic validation of file metadata
+                url = info.get("url") or ""
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    raise ValueError("bad file url")
+                key_h = info.get("key") or ""
+                nonce_h = info.get("nonce") or ""
+                if not re.fullmatch(r"[0-9a-fA-F]{64}", key_h):
+                    raise ValueError("bad file key")
+                if not re.fullmatch(r"[0-9a-fA-F]{24}", nonce_h):
+                    raise ValueError("bad file nonce")
+
+                ct = download(session, url, cb, info.get("sha256"))
+                data = decrypt_file(ct, key_h, nonce_h)
                 outdir = Path.home() / "Downloads" / "nyx"
                 outdir.mkdir(parents=True, exist_ok=True)
-                out = outdir / info["name"]
+                # prevent path traversal via malicious filename
+                safe_name = Path(str(info.get("name") or "file")).name
+                safe_name = re.sub(r"[^\w.\- \u0600-\u06FF]+", "_", safe_name).strip("._") or "file"
+                if len(safe_name) > 180:
+                    safe_name = safe_name[:180]
+                out = outdir / safe_name
                 i = 1
                 while out.exists():
-                    out = outdir / f"{Path(info['name']).stem} ({i}){Path(info['name']).suffix}"
+                    stem = Path(safe_name).stem
+                    suf = Path(safe_name).suffix
+                    out = outdir / f"{stem} ({i}){suf}"
                     i += 1
                 out.write_bytes(data)
                 self.download_result = str(out)
@@ -1024,8 +1044,8 @@ class App:
         # separator
         self.safe(3, 0, "─" * (sw - 1), A(10))
         if not self.chats:
-            self.safe(5, 2, "No chats yet", A(7))
-            self.safe(6, 2, "Ctrl+N to add", A(7))
+            self.safe(5, 2, "✉  No chats yet", A(7))
+            self.safe(6, 2, "→  Ctrl+N to add a contact", A(3))
         band = int(round(self.sel_y))
         for i, c in enumerate(self.chats):
             cy = 5 + i * 2
@@ -1070,7 +1090,10 @@ class App:
         elif self.download_progress is not None:
             st = f"⬇ {int(self.download_progress * 100)}%  {self.download_name[:16]}"
             ready = False
-        self.safe(h - 1, 2, st[: sw - 3], A(3) if ready else A(7))
+        dot_attr = (A(3) if ready else
+                    A(9) if self.node and self.node.phase == "error" else A(12))
+        self.safe(h - 1, 2, "●", dot_attr | self.curses.A_BOLD)
+        self.safe(h - 1, 4, st[: sw - 5], A(3) if ready else A(7))
 
     def _style_attr(self, style, mine, base_attr):
         """Map format style name → curses attribute."""
@@ -1201,8 +1224,17 @@ class App:
             cx = px + max(0, (pw - 28) // 2)
             self.safe(h // 2 - 2, cx, "✦  Nyx  ✦", A(3) | self.curses.A_BOLD)
             self.safe(h // 2,     cx - 2, "Private messenger over Tor", A(7))
-            self.safe(h // 2 + 2, cx - 4, "Ctrl+N  contact   Ctrl+G  group", A(7))
-            self.safe(h // 2 + 3, cx - 4, "Ctrl+Y  channel  Ctrl+U  @user", A(7))
+            bold = self.curses.A_BOLD
+            for row, pairs in (
+                (h // 2 + 2, [("Ctrl+N", " contact   "), ("Ctrl+G", " group")]),
+                (h // 2 + 3, [("Ctrl+Y", " channel  "), ("Ctrl+U", " @user")]),
+            ):
+                x = cx - 4
+                for key, rest in pairs:
+                    self.safe(row, x, key, A(12) | bold)
+                    x += len(key)
+                    self.safe(row, x, rest, A(7))
+                    x += len(rest)
             self.safe(h // 2 + 4, cx - 4, "**bold**  *italic*  `code`", A(7))
             return
         if c.get("is_group"):
@@ -1518,8 +1550,7 @@ class App:
         self.load_profile()
         self.load_groups()
         self.onboarding()
-        self.start_node()
-        # keep relay/tor logs from wrecking the curses UI
+        # redirect stderr BEFORE node starts (relay errors must not paint the UI)
         log_path = HOME / "nyx.log"
         try:
             _logf = open(log_path, "a", encoding="utf-8")
@@ -1528,6 +1559,7 @@ class App:
         except Exception:
             _logf = None
             _old_err = None
+        self.start_node()
         try:
             while True:
                 self.frame += 1
